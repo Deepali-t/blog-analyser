@@ -69,7 +69,7 @@ RULE_METRIC_MAP: Dict[str, Tuple[str, str]] = {
     "EXACT_MATCH_ANCHOR":           ("internal_anchor_has_kw",      "bool"),
     # ── Content richness ─────────────────────────────────────────────────────
     "MIN_STATS_COUNT":              ("stats_count",                 "min"),
-    "FAQ_COUNT":                    ("faq_count",                   "min"),
+    "FAQ_COUNT":                    ("faq_count",                   "exact"),
     "FAQ_ANSWER_WORD_COUNT_MIN":    ("faq_min_answer_words",        "min"),
     "FAQ_ANSWER_WORD_COUNT_MAX":    ("faq_max_answer_words",        "max"),
     "CLEAR_CTA_END":                ("has_cta_end",                 "bool"),
@@ -108,6 +108,60 @@ RULE_LABELS: Dict[str, str] = {
     "FAQ_ANSWER_WORD_COUNT_MIN":    "FAQ Answer Min Word Count",
     "FAQ_ANSWER_WORD_COUNT_MAX":    "FAQ Answer Max Word Count",
     "CLEAR_CTA_END":                "Clear CTA at End of Post",
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Embedded Guidelines (22 rules — guideline upload disabled)
+# ─────────────────────────────────────────────────────────────────────────────
+
+EMBEDDED_GUIDELINES: Dict[str, Union[bool, int, float]] = {
+    "TITLE_KEYWORD_H1":                True,
+    "FIRST_150_WORDS_KEYWORD_COUNT":   2,
+    "FIRST_PARAGRAPH_KEYWORD":         True,
+    "MIN_H2_H3_KEYWORD_COUNT":         2,
+    "META_TITLE_START_KEYWORD":        True,
+    "TITLE_LENGTH_MAX":                60,
+    "META_KEYWORD":                    True,
+    "META_LENGTH_MAX":                 140,
+    "INTERNAL_LINKS_SITEMAP":          True,
+    "MIN_SECONDARY_KEYWORD_DENSITY":   0.3,
+    "DUPLICATE_INTERNAL_LINKS":        False,
+    "MIN_READABILITY_SCORE":           60.0,
+    "MIN_PARAGRAPH_WORDS":             15,
+    "MAX_PARAGRAPH_WORDS":             53,
+    "FAQ_COUNT":                       5,
+    "FAQ_ANSWER_WORD_COUNT_MIN":       15,
+    "FAQ_ANSWER_WORD_COUNT_MAX":       35,
+    "KEYWORD_DISTRIBUTION_INTERVAL":   200,
+    "CLEAR_CTA_END":                   True,
+    "MIN_STATS_COUNT":                 3,
+    "MIN_TRANSITION_WORDS_PERCENT":    15.0,
+    "MAX_EXTERNAL_LINKS":              3,
+}
+
+GUIDELINE_DESCRIPTIONS: Dict[str, str] = {
+    "TITLE_KEYWORD_H1":                "Primary keyword must be present in the H1 tag / Title of the page.",
+    "FIRST_150_WORDS_KEYWORD_COUNT":   "Use the primary keyword exactly 2 times within the first 150 words.",
+    "FIRST_PARAGRAPH_KEYWORD":         "The primary keyword must appear in the first paragraph of the blog.",
+    "MIN_H2_H3_KEYWORD_COUNT":         "The primary keyword must be placed in H2 or H3 subheadings at least 2 times.",
+    "META_TITLE_START_KEYWORD":        "The primary keyword must be placed right at the start of the meta title.",
+    "TITLE_LENGTH_MAX":                "The meta title must not exceed 60 characters in length.",
+    "META_KEYWORD":                    "The primary keyword must be present in the meta description.",
+    "META_LENGTH_MAX":                 "The meta description must not exceed 140 characters in length.",
+    "INTERNAL_LINKS_SITEMAP":          "Content must contain internal links to related blogs and landing pages.",
+    "MIN_SECONDARY_KEYWORD_DENSITY":   "At least one secondary keyword must have a density between 0.3% and 0.4%.",
+    "DUPLICATE_INTERNAL_LINKS":        "Do not link to the exact same internal URL more than once in the article.",
+    "MIN_READABILITY_SCORE":           "Ensure content is easy to read (Target standard Flesch Reading Ease score of 60+).",
+    "MIN_PARAGRAPH_WORDS":             "Paragraph size must be a minimum of 1 line (assumed minimum of 15 words).",
+    "MAX_PARAGRAPH_WORDS":             "Paragraph size must be a maximum of 3.5 lines (3.5 lines × 15 words = 53 words max).",
+    "FAQ_COUNT":                       "Exactly 5 FAQs must be included on the page.",
+    "FAQ_ANSWER_WORD_COUNT_MIN":       "Each FAQ answer must be a minimum of 15 words.",
+    "FAQ_ANSWER_WORD_COUNT_MAX":       "Each FAQ answer must be a maximum of 35 words.",
+    "KEYWORD_DISTRIBUTION_INTERVAL":   "The primary keyword must appear evenly, at least once every 200 words.",
+    "CLEAR_CTA_END":                   "A clear Call-to-Action (CTA) must be present at the very end of the blog post.",
+    "MIN_STATS_COUNT":                 "At least 3 statistical data points from credible research studies must be cited.",
+    "MIN_TRANSITION_WORDS_PERCENT":    "Transition words must make up a minimum of 15% of the content.",
+    "MAX_EXTERNAL_LINKS":              "Do not place more than 3 external links throughout the content.",
 }
 
 # ── Regex patterns ────────────────────────────────────────────────────────────
@@ -690,6 +744,12 @@ def evaluate_rule(key: str, value, metrics: dict) -> Optional[Tuple[bool, str, s
         u = _unit(metric_name)
         return passed, f"≤ {_fmt_val(value)}{u}", f"{_fmt_val(actual)}{u}"
 
+    elif operator == "exact":
+        if isinstance(value, (bool, str)):
+            return None
+        passed = actual == value
+        return passed, f"= {_fmt_val(value)}", f"{_fmt_val(actual)}"
+
     return None
 
 
@@ -750,15 +810,11 @@ def main() -> None:
     )
 
     st.title("📊 SEO & Content Analyzer")
-    st.caption("100 % local — no external API calls required.")
+    st.caption("Guidelines are pre-loaded (22 rules). Upload your blog and fill in SEO fields to analyse.")
 
     # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
-        st.header("📁 Documents")
-        guidelines_file = st.file_uploader(
-            "Guidelines Document", type=["docx", "pdf"],
-            help="Contains [KEY] = value | description rules.",
-        )
+        st.header("📁 Blog Document")
         blog_file = st.file_uploader("Blog Content Document", type=["docx", "pdf"])
 
         st.divider()
@@ -786,9 +842,27 @@ def main() -> None:
         st.divider()
         run_btn = st.button("▶  Run Analysis", type="primary", use_container_width=True)
 
-    # ── Extract text ──────────────────────────────────────────────────────────
-    blog_text:       Optional[str] = None
-    guidelines_text: str           = ""
+    # ── Active Guidelines panel (always visible, full list) ───────────────────
+    with st.expander("📋 Active Guidelines — 22 Rules (click to view)", expanded=False):
+        for idx, (key, value) in enumerate(EMBEDDED_GUIDELINES.items(), 1):
+            label = RULE_LABELS.get(key, key.replace("_", " ").title())
+            desc  = GUIDELINE_DESCRIPTIONS.get(key, "")
+            if isinstance(value, bool):
+                val_str = "Required" if value else "Not allowed"
+            elif isinstance(value, float):
+                val_str = f"{value} %"
+            else:
+                val_str = str(value)
+            st.markdown(
+                f"**{idx}. {label}** &nbsp;`{val_str}`  \n"
+                f"<span style='color:#aaa;font-size:13px'>{desc}</span>",
+                unsafe_allow_html=True,
+            )
+            if idx < len(EMBEDDED_GUIDELINES):
+                st.divider()
+
+    # ── Extract blog text ─────────────────────────────────────────────────────
+    blog_text: Optional[str] = None
 
     if blog_file:
         try:
@@ -796,33 +870,19 @@ def main() -> None:
         except Exception as exc:
             st.error(f"Could not read blog file: {exc}")
 
-    if guidelines_file:
-        try:
-            guidelines_text = extract_text(guidelines_file)
-        except Exception as exc:
-            st.warning(f"Could not read guidelines file ({exc}). Using defaults.")
-
-    # ── File preview expanders ────────────────────────────────────────────────
-    if guidelines_text or blog_text:
-        pc1, pc2 = st.columns(2)
-        if guidelines_text:
-            with pc1:
-                with st.expander("📋 Guidelines Document Preview", expanded=False):
-                    prev = guidelines_text[:3000]
-                    st.text(prev + ("\n\n[… truncated]" if len(guidelines_text) > 3000 else ""))
-        if blog_text:
-            with pc2:
-                with st.expander("📝 Blog Content Preview", expanded=False):
-                    prev = blog_text[:3000]
-                    st.text(prev + ("\n\n[… truncated]" if len(blog_text) > 3000 else ""))
+    # ── Blog content preview ──────────────────────────────────────────────────
+    if blog_text:
+        with st.expander("📝 Blog Content Preview", expanded=False):
+            st.text(blog_text[:5000] + ("\n\n[… truncated]" if len(blog_text) > 5000 else ""))
 
     # ── Idle guard ────────────────────────────────────────────────────────────
     if not run_btn:
         st.info(
             "**Getting started:**\n\n"
-            "1. Upload a **Guidelines Document** with `[KEY] = value | description` rules.\n"
-            "2. Upload your **Blog Content Document**.\n"
-            "3. Fill in the SEO fields and click **▶ Run Analysis**."
+            "1. Upload your **Blog Content Document** (.docx or .pdf) in the sidebar.\n"
+            "2. Fill in **Focus Keyword**, **SEO Title**, and **Meta Description**.\n"
+            "3. Optionally add **Secondary Keywords** (comma-separated).\n"
+            "4. Click **▶ Run Analysis**."
         )
         return
 
@@ -833,8 +893,8 @@ def main() -> None:
         st.error("The blog document appears to be empty or could not be parsed.")
         return
 
-    # ── Parse guidelines ──────────────────────────────────────────────────────
-    G = {**DEFAULTS, **parse_guidelines(guidelines_text)}
+    # ── Use embedded guidelines ───────────────────────────────────────────────
+    G = EMBEDDED_GUIDELINES
 
     # ── Build metrics ─────────────────────────────────────────────────────────
     with st.spinner("Analysing content…"):
@@ -860,8 +920,8 @@ def main() -> None:
     )
     m1.metric("📖 Reading Ease", f"{score} ({read_label})")
 
-    d_min = G.get("MIN_KEYWORD_DENSITY", 1.5)
-    d_max = G.get("MAX_KEYWORD_DENSITY", 3.5)
+    # Embedded guidelines don't have MIN/MAX_KEYWORD_DENSITY — use display defaults
+    d_min, d_max = 1.5, 3.5
     if kw_pct < d_min:
         dd, dc = f"↓ below {d_min} %", "inverse"
     elif kw_pct > d_max:
@@ -870,7 +930,7 @@ def main() -> None:
         dd, dc = "✓ in range", "normal"
     m2.metric("🎯 Keyword Density", f"{kw_pct} %", delta=dd, delta_color=dc)
 
-    wc_min = G.get("MIN_WORD_COUNT", 1000)
+    wc_min = 1000  # not in embedded guidelines, display-only default
     m3.metric(
         "📝 Word Count", f"{wc:,}",
         delta=f"↓ {wc_min - wc:,} short" if wc < wc_min else f"✓ meets {wc_min:,}",
@@ -887,10 +947,11 @@ def main() -> None:
     if sec_data:
         for row in sec_data:
             d = row["Density %"]
+            # Guideline: at least one secondary keyword between 0.3%–0.4%
             row["Status"] = (
-                "🟢 Good"     if d_min <= d <= d_max else
-                "🟡 Low"      if d < d_min            else
-                "🔴 Too High"
+                "🟢 In Range (0.3–0.4%)" if 0.3 <= d <= 0.4 else
+                "🟡 Low (< 0.3%)"        if d < 0.3          else
+                "🟠 High (> 0.4%)"
             )
         st.dataframe(sec_data, use_container_width=True, hide_index=True)
     else:
