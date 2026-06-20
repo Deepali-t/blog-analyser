@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import streamlit as st
 import textstat
+from streamlit_quill import st_quill
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -93,12 +94,11 @@ RULE_LABELS: Dict[str, str] = {
     "MIN_READABILITY_SCORE":        "Minimum Flesch Reading Ease",
     "MIN_TRANSITION_WORDS_PERCENT": "Min Transition Words %",
     "MIN_WORD_COUNT":               "Minimum Word Count",
-    "MIN_PARAGRAPH_WORDS":          "Min Words Per Paragraph",
     "MAX_PARAGRAPH_WORDS":          "Max Words Per Paragraph",
     "MIN_HEADING_COUNT":            "Minimum Heading Count",
     "MAX_HEADING_COUNT":            "Maximum Heading Count",
     "INTERNAL_LINKS_SITEMAP":       "Internal Links Present",
-    "MIN_INTERNAL_LINKS":           "Minimum Internal Links",
+    "MIN_INTERNAL_LINKS":           "Internal Link Count",
     "MAX_INTERNAL_LINKS":           "Maximum Internal Links",
     "MAX_EXTERNAL_LINKS":           "Maximum External Links",
     "DUPLICATE_INTERNAL_LINKS":     "Duplicate Internal Links",
@@ -123,15 +123,14 @@ EMBEDDED_GUIDELINES: Dict[str, Union[bool, int, float]] = {
     "TITLE_LENGTH_MAX":                60,
     "META_KEYWORD":                    True,
     "META_LENGTH_MAX":                 140,
-    "INTERNAL_LINKS_SITEMAP":          True,
+    "MIN_INTERNAL_LINKS":              3,
     "MIN_SECONDARY_KEYWORD_DENSITY":   0.3,
     "DUPLICATE_INTERNAL_LINKS":        False,
     "MIN_READABILITY_SCORE":           60.0,
-    "MIN_PARAGRAPH_WORDS":             15,
     "MAX_PARAGRAPH_WORDS":             53,
     "FAQ_COUNT":                       5,
     "FAQ_ANSWER_WORD_COUNT_MIN":       15,
-    "FAQ_ANSWER_WORD_COUNT_MAX":       35,
+    "FAQ_ANSWER_WORD_COUNT_MAX":       80,
     "KEYWORD_DISTRIBUTION_INTERVAL":   200,
     "CLEAR_CTA_END":                   True,
     "MIN_STATS_COUNT":                 3,
@@ -148,11 +147,10 @@ GUIDELINE_DESCRIPTIONS: Dict[str, str] = {
     "TITLE_LENGTH_MAX":                "The meta title must not exceed 60 characters in length.",
     "META_KEYWORD":                    "The primary keyword must be present in the meta description.",
     "META_LENGTH_MAX":                 "The meta description must not exceed 140 characters in length.",
-    "INTERNAL_LINKS_SITEMAP":          "Content must contain internal links to related blogs and landing pages.",
+    "MIN_INTERNAL_LINKS":              "Content must contain at least 3 internal links to related blogs and landing pages.",
     "MIN_SECONDARY_KEYWORD_DENSITY":   "At least one secondary keyword must have a density between 0.3% and 0.4%.",
     "DUPLICATE_INTERNAL_LINKS":        "Do not link to the exact same internal URL more than once in the article.",
     "MIN_READABILITY_SCORE":           "Ensure content is easy to read (Target standard Flesch Reading Ease score of 60+).",
-    "MIN_PARAGRAPH_WORDS":             "Paragraph size must be a minimum of 1 line (assumed minimum of 15 words).",
     "MAX_PARAGRAPH_WORDS":             "Paragraph size must be a maximum of 3.5 lines (3.5 lines × 15 words = 53 words max).",
     "FAQ_COUNT":                       "Exactly 5 FAQs must be included on the page.",
     "FAQ_ANSWER_WORD_COUNT_MIN":       "Each FAQ answer must be a minimum of 15 words.",
@@ -230,6 +228,38 @@ _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 
 
+def _is_list_or_table_block(text: str) -> bool:
+    """Return True for bullet lists and comparison-table blocks.
+    Used to exclude them from paragraph word-count stats and Flesch calculation."""
+    s = text.strip()
+    if re.match(r"^[●•\-\*\+]\s", s):
+        return True
+    lines = [l.strip() for l in s.split("\n") if l.strip()]
+    if len(lines) >= 3:
+        avg_words = sum(len(l.split()) for l in lines) / len(lines)
+        if avg_words < 7:
+            return True
+    yn_count = len(re.findall(r"\b(Yes|No|Limited)\b", s, re.IGNORECASE))
+    if yn_count >= 4:
+        return True
+    return False
+
+
+def _prose_text(text: str) -> str:
+    """Return prose-only text for Flesch and keyword-distribution gap.
+    Strips URLs, anchor markers, and list/table blocks."""
+    t = _ANCHOR_LINK_RE.sub(r"\1", text)
+    t = _URL_RE.sub("", t)
+    blocks = [b.strip() for b in re.split(r"\n\s*\n", t) if b.strip()]
+    prose = [
+        b for b in blocks
+        if not b.lstrip().startswith("#")
+        and not _is_list_or_table_block(b)
+        and len(b.split()) >= 20
+    ]
+    return " ".join(prose) if prose else t
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Document Text Extraction
 # ─────────────────────────────────────────────────────────────────────────────
@@ -293,15 +323,81 @@ def _mark_pdf_headings(text: str) -> str:
             and not is_num_list
         )
         if looks_like_heading:
-            prev_empty   = i == 0 or not lines[i - 1].strip()
+            prev_empty    = i == 0 or not lines[i - 1].strip()
             next_nonempty = next((l.strip() for l in lines[i + 1:i + 4] if l.strip()), "")
-            next_longer  = len(next_nonempty.split()) > len(words) if next_nonempty else False
-            if prev_empty or next_longer:
+            next_longer   = len(next_nonempty.split()) > len(words) if next_nonempty else False
+            # Treat as heading when preceded by a longer body paragraph (original lines)
+            prev_nonempty_orig = next((lines[j].strip() for j in range(i - 1, -1, -1)
+                                       if lines[j].strip()), "")
+            prev_longer = len(prev_nonempty_orig.split()) > len(words) if prev_nonempty_orig else False
+            # Chain: if the last processed non-empty line was already a heading, mark this too
+            # (handles PDF page-header lines that steal the i==0 slot before the real title)
+            last_out = next((l for l in reversed(out) if l.strip()), "")
+            prev_was_heading = last_out.lstrip().startswith("#")
+            if prev_empty or next_longer or prev_longer or prev_was_heading:
                 out.append(f"# {s}")
                 continue
 
         out.append(line)
     return "\n".join(out)
+
+
+def parse_html_content(html: str) -> str:
+    """
+    Convert pasted HTML (from CMS, Google Docs, rich editor) into our internal
+    plain-text format:
+      • <h1>…</h1>  →  # heading
+      • <h2>…</h2>  →  ## heading
+      • <h3>…</h3>  →  ### heading
+      • <a href="url">anchor</a>  →  anchor «anchor|url»
+      • <p> / <div> / <li>  →  paragraph block (double-newline separated)
+      • <strong>/<b>/<em>/<i>  →  plain text (bold/italic stripped for analysis)
+    """
+    from bs4 import BeautifulSoup, NavigableString, Tag
+
+    soup = BeautifulSoup(html, "html.parser")
+    blocks: List[str] = []
+
+    def _node_text(node) -> str:
+        """Recursively render a node to text, preserving anchor markers."""
+        if isinstance(node, NavigableString):
+            return str(node)
+        if not isinstance(node, Tag):
+            return ""
+        if node.name == "a":
+            href = (node.get("href") or "").strip()
+            anchor = node.get_text(" ", strip=True)
+            if href.startswith("http") and anchor:
+                return f"{anchor} «{anchor}|{href}»"
+            return anchor
+        if node.name in ("br",):
+            return "\n"
+        return "".join(_node_text(c) for c in node.children)
+
+    for elem in soup.find_all(
+        ["h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "blockquote", "div"],
+        recursive=True,
+    ):
+        # Skip divs that just contain other block elements (avoid duplication)
+        if elem.name == "div" and elem.find(["h1","h2","h3","h4","h5","h6","p","li"]):
+            continue
+
+        tag = elem.name
+        if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            level = int(tag[1])
+            text  = elem.get_text(" ", strip=True)
+            if text:
+                blocks.append(f"{'#' * level} {text}")
+        else:
+            text = "".join(_node_text(c) for c in elem.children).strip()
+            if text:
+                blocks.append(text)
+
+    result = "\n\n".join(b for b in blocks if b.strip())
+    # If BeautifulSoup found no block elements, fall back to plain-text heuristic
+    if not result.strip():
+        result = _mark_pdf_headings(soup.get_text("\n"))
+    return result
 
 
 def _extract_pdf(data: bytes) -> str:
@@ -424,7 +520,10 @@ def count_words(text: str) -> int:
 def contains_keyword(snippet: str, keyword: str) -> bool:
     if not keyword.strip():
         return False
-    return bool(re.search(re.escape(keyword), snippet, re.IGNORECASE))
+    # Normalise whitespace — PDFs sometimes use non-breaking or multiple spaces
+    norm_s = re.sub(r"[\s\xa0]+", " ", snippet).strip()
+    norm_k = re.sub(r"[\s\xa0]+", " ", keyword).strip()
+    return bool(re.search(re.escape(norm_k), norm_s, re.IGNORECASE))
 
 
 def keyword_density(text: str, keyword: str) -> Tuple[int, float]:
@@ -468,8 +567,11 @@ def structural_analysis(clean_text: str, keyword: str) -> dict:
     h2_h3_kw_count = sum(1 for h in h2_h3 if contains_keyword(h, keyword))
 
     para_lengths = [(p, len(p.split())) for p in body]
-    max_pw = max((w for _, w in para_lengths), default=0)
-    min_pw = min((w for _, w in para_lengths if w > 0), default=0)
+    # Exclude list/table blocks and very short items (< 8 words) from min/max stats
+    prose_paras = [(p, w) for p, w in para_lengths if w >= 8 and not _is_list_or_table_block(p)]
+    use_paras   = prose_paras if prose_paras else para_lengths
+    max_pw = max((w for _, w in use_paras), default=0)
+    min_pw = min((w for _, w in use_paras if w > 0), default=0)
 
     all_body_words  = " ".join(body).split()
     first_150_text  = " ".join(all_body_words[:150])
@@ -501,13 +603,24 @@ def analyze_links(text: str, internal_domain: str, focus_keyword: str = "") -> d
     ]
     plain_text = _ANCHOR_LINK_RE.sub("", text)
 
-    bare_urls      = _URL_RE.findall(plain_text)
+    # Bare URLs from plain text (after removing «anchor|url» markers)
+    bare_urls       = _URL_RE.findall(plain_text)
     structured_urls = [url for _, url in structured]
-    all_urls       = bare_urls + structured_urls
+
+    # Deduplicate: a bare URL that already appears as a structured «anchor|url»
+    # marker is the same link (PDF annotation blob re-lists inline links).
+    structured_set = {u.lower().rstrip("/") for u in structured_urls}
+    bare_unique     = [u for u in bare_urls if u.lower().rstrip("/") not in structured_set]
+
+    all_urls = bare_unique + structured_urls
 
     internal = [u for u in all_urls if domain and domain in u.lower()]
     external = [u for u in all_urls if not domain or domain not in u.lower()]
-    dup_internal = sum(1 for c in Counter(internal).values() if c > 1)
+
+    # Duplicates = same internal URL linked more than once in the body
+    dup_internal = sum(
+        1 for c in Counter(u.lower().rstrip("/") for u in internal).values() if c > 1
+    )
 
     internal_anchors = [a for a, u in structured if domain and domain in u.lower()]
     anchor_has_kw    = (
@@ -531,50 +644,68 @@ def count_statistics(text: str) -> int:
 
 
 def analyze_faqs(blocks: List[str]) -> dict:
+    # Find FAQ section heading at block level first
     faq_start = next(
         (i for i, b in enumerate(blocks)
          if re.search(r"\bfaq\b", b, re.IGNORECASE) and is_heading_block(b)),
         -1,
     )
-    search = blocks[faq_start + 1:] if faq_start >= 0 else blocks
+    # Also scan at line level (PDF may not have blank lines around the FAQ heading)
+    if faq_start < 0:
+        for i, b in enumerate(blocks):
+            for ln in b.split("\n"):
+                clean_ln = re.sub(r"^[#*_`]+\s*", "", ln).strip()
+                if re.match(r"^faqs?\s*$", clean_ln, re.IGNORECASE):
+                    faq_start = i
+                    break
+            if faq_start >= 0:
+                break
+
+    search_blocks = blocks[faq_start + 1:] if faq_start >= 0 else blocks
+
+    # Flatten all content lines from the FAQ section (handles PDF with no blank-line separators)
+    all_lines: List[str] = []
+    for block in search_blocks:
+        for ln in block.split("\n"):
+            cleaned = re.sub(r"^[#*_`]+\s*", "", ln).strip()
+            if cleaned:
+                all_lines.append(cleaned)
+
+    # Sentinel: stop collecting FAQ content if we hit metadata-like headings
+    _META_STOP_RE = re.compile(
+        r"^(meta\s+description|seo\s+title|references?|bibliography|"
+        r"tl;dr|about\s+the\s+author|conclusion|summary)",
+        re.IGNORECASE,
+    )
+
+    def _is_faq_question(line: str) -> bool:
+        words = line.split()
+        return line.endswith("?") and 2 <= len(words) <= 30
+
+    def _is_section_stop(line: str) -> bool:
+        """Return True when a line signals we've left the FAQ section."""
+        clean = re.sub(r"^[#*_`]+\s*", "", line).strip()
+        return bool(_META_STOP_RE.match(clean))
 
     answer_word_counts: List[int] = []
     i = 0
-    while i < len(search):
-        block       = search[i]
-        block_lines = block.split("\n")
-        first_line  = re.sub(r"[#*_`]", "", block_lines[0]).strip()
-        full_clean  = re.sub(r"[#*_`]", "", block).strip()
-
-        # Case 1: heading block whose first line ends with '?'
-        if is_heading_block(block) and first_line.endswith("?") and len(first_line.split()) <= 30:
-            inline_answer = "\n".join(block_lines[1:]).strip()
-            if inline_answer:
-                answer_word_counts.append(len(inline_answer.split()))
-                i += 1
-                continue
+    while i < len(all_lines):
+        if _is_section_stop(all_lines[i]):
+            break
+        if _is_faq_question(all_lines[i]):
             j = i + 1
-            while j < len(search) and is_heading_block(search[j]):
+            answer_parts: List[str] = []
+            while j < len(all_lines) and not _is_faq_question(all_lines[j]):
+                if _is_section_stop(all_lines[j]):
+                    break
+                answer_parts.append(all_lines[j])
                 j += 1
-            if j < len(search):
-                ans = re.sub(r"[#*_`]", "", search[j]).strip()
-                answer_word_counts.append(len(ans.split()))
-                i = j + 1
-                continue
-
-        # Case 2: short body question block
-        elif not is_heading_block(block) and len(full_clean.split()) <= 30:
-            if _QUESTION_RE.match(full_clean) or full_clean.endswith("?"):
-                j = i + 1
-                while j < len(search) and is_heading_block(search[j]):
-                    j += 1
-                if j < len(search):
-                    ans = re.sub(r"[#*_`]", "", search[j]).strip()
-                    answer_word_counts.append(len(ans.split()))
-                    i = j + 1
-                    continue
-
-        i += 1
+            answer_text = " ".join(answer_parts).strip()
+            if answer_text:
+                answer_word_counts.append(len(answer_text.split()))
+            i = j
+        else:
+            i += 1
 
     if not answer_word_counts:
         return {"faq_count": 0, "faq_min_answer_words": 0, "faq_max_answer_words": 0}
@@ -634,6 +765,20 @@ def transition_words_percent(text: str) -> float:
 # Unified Metrics Bundle
 # ─────────────────────────────────────────────────────────────────────────────
 
+def transition_words_debug(text: str) -> List[Tuple[str, str]]:
+    """Return (sentence, matched_transition_word) for every sentence that has one."""
+    sentences = [s.strip() for s in re.split(r"[.!?]+", text) if s.strip()]
+    matches: List[Tuple[str, str]] = []
+    for sent in sentences:
+        sl = sent.lower()
+        for tw in _TRANSITION_WORDS:
+            found = (tw in sl) if " " in tw else bool(re.search(r"\b" + re.escape(tw) + r"\b", sl))
+            if found:
+                matches.append((sent.strip(), tw))
+                break
+    return matches
+
+
 def build_metrics(
     blog_text:        str,
     clean_text:       str,
@@ -643,16 +788,17 @@ def build_metrics(
     internal_domain:  str,
     secondary_kw_raw: str = "",
 ) -> dict:
+    prose           = _prose_text(clean_text)
     wc              = count_words(blog_text)
-    score           = readability_score(blog_text)
+    score           = readability_score(prose if len(prose.split()) > 50 else blog_text)
     kw_hits, kw_pct = keyword_density(blog_text, focus_keyword)
     struct          = structural_analysis(clean_text, focus_keyword)
-    links           = analyze_links(blog_text, internal_domain, focus_keyword)
+    links           = analyze_links(clean_text, internal_domain, focus_keyword)
     stats_n         = count_statistics(blog_text)
     faq             = analyze_faqs(split_blocks(clean_text))
     sec_results     = secondary_keyword_analysis(blog_text, secondary_kw_raw)
     sec_max_density = max((r["Density %"] for r in sec_results), default=0.0)
-    kw_gap          = keyword_dist_max_gap(blog_text, focus_keyword)
+    kw_gap          = keyword_dist_max_gap(prose if len(prose.split()) > 50 else blog_text, focus_keyword)
     cta_ok          = has_cta_at_end(blog_text)
     trans_pct       = transition_words_percent(blog_text)
 
@@ -722,33 +868,48 @@ def evaluate_rule(key: str, value, metrics: dict) -> Optional[Tuple[bool, str, s
 
     if operator == "bool":
         if isinstance(value, bool) and not value:
-            return True, "Not required", "—"
-        passed = bool(actual)
-        return passed, "Required", ("Present ✓" if passed else "Not found ✗")
+            return "pass", "Not required", "—"
+        status = "pass" if bool(actual) else "fail"
+        return status, "Required", ("Present ✓" if status == "pass" else "Not found ✗")
 
     elif operator == "min":
         if isinstance(value, (bool, str)):
             return None
-        passed = actual >= value
         u = _unit(metric_name)
-        return passed, f"≥ {_fmt_val(value)}{u}", f"{_fmt_val(actual)}{u}"
+        if actual < value:
+            status = "fail"
+        elif actual == value:
+            status = "pass"
+        else:           # actual > value → exceeds minimum
+            status = "warn"
+        return status, f"≥ {_fmt_val(value)}{u}", f"{_fmt_val(actual)}{u}"
 
     elif operator == "max":
         if isinstance(value, bool):
             if value:
-                return True, "No limit", _fmt_val(actual)
+                return "pass", "No limit", _fmt_val(actual)
             value = 0
         elif isinstance(value, str):
             return None
-        passed = actual <= value
         u = _unit(metric_name)
-        return passed, f"≤ {_fmt_val(value)}{u}", f"{_fmt_val(actual)}{u}"
+        if actual > value:
+            status = "fail"
+        elif value > 0 and actual > value * 0.85:
+            status = "warn"   # approaching the limit
+        else:
+            status = "pass"
+        return status, f"≤ {_fmt_val(value)}{u}", f"{_fmt_val(actual)}{u}"
 
     elif operator == "exact":
         if isinstance(value, (bool, str)):
             return None
-        passed = actual == value
-        return passed, f"= {_fmt_val(value)}", f"{_fmt_val(actual)}"
+        if actual == value:
+            status = "pass"
+        elif actual > value:
+            status = "warn"   # more than required (e.g. 6 FAQs when 5 needed)
+        else:
+            status = "fail"
+        return status, f"= {_fmt_val(value)}", f"{_fmt_val(actual)}"
 
     return None
 
@@ -761,11 +922,13 @@ def _key_to_label(key: str) -> str:
     return key.replace("_", " ").title()
 
 
-def _check_row(label: str, passed, required: str, actual: str) -> None:
-    if passed is None:
+def _check_row(label: str, status, required: str, actual: str) -> None:
+    if status is None:
         icon, ac = "⚪", "#888"
-    elif passed:
+    elif status == "pass":
         icon, ac = "🟢", "#4CAF50"
+    elif status == "warn":
+        icon, ac = "🟡", "#FFC107"
     else:
         icon, ac = "🔴", "#F44336"
 
@@ -814,9 +977,6 @@ def main() -> None:
 
     # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
-        st.header("📁 Blog Document")
-        blog_file = st.file_uploader("Blog Content Document", type=["docx", "pdf"])
-
         st.divider()
         st.header("🔍 SEO Metadata")
         focus_keyword    = st.text_input("Focus Keyword",    placeholder="e.g. multilingual AI interview platforms")
@@ -861,40 +1021,84 @@ def main() -> None:
             if idx < len(EMBEDDED_GUIDELINES):
                 st.divider()
 
-    # ── Extract blog text ─────────────────────────────────────────────────────
+    # ── Blog content input: Upload OR Paste ───────────────────────────────────
+    st.divider()
+    tab_upload, tab_paste = st.tabs(["📂 Upload File (.docx / .pdf)", "📋 Paste Content"])
+
     blog_text: Optional[str] = None
 
-    if blog_file:
-        try:
-            blog_text = extract_text(blog_file)
-        except Exception as exc:
-            st.error(f"Could not read blog file: {exc}")
+    with tab_upload:
+        upload_file = st.file_uploader(
+            "Upload your blog document", type=["docx", "pdf"],
+            label_visibility="collapsed",
+        )
+        if upload_file:
+            try:
+                blog_text = extract_text(upload_file)
+                st.success(f"Loaded **{upload_file.name}** — {len(blog_text.split()):,} words detected.")
+            except Exception as exc:
+                st.error(f"Could not read file: {exc}")
+
+    with tab_paste:
+        _paste_saved = st.session_state.get("paste_content", "")
+        if _paste_saved:
+            _wc = len(_paste_saved.split())
+            _col1, _col2 = st.columns([5, 1])
+            _col1.success(f"Content loaded — **{_wc:,} words** ready for analysis.")
+            if _col2.button("Replace", key="replace_paste"):
+                st.session_state["paste_content"] = ""
+                for _k in list(st.session_state.keys()):
+                    if _k.startswith("quill_"):
+                        del st.session_state[_k]
+                st.rerun()
+            blog_text = _paste_saved
+        else:
+            st.markdown(
+                "Copy your blog from **Google Docs**, **Word**, or any rich editor "
+                "and paste below — headings, bold, and hyperlinks are all preserved."
+            )
+            quill_html = st_quill(
+                placeholder="Paste your blog here (Cmd+V / Ctrl+V)…",
+                html=True,
+                key="quill_editor",
+            )
+            # Quill returns "<p><br></p>" when empty
+            if quill_html and quill_html.strip() not in ("", "<p><br></p>"):
+                parsed = parse_html_content(quill_html)
+                if parsed.strip():
+                    st.session_state["paste_content"] = parsed
+                    blog_text = parsed
+                    st.rerun()
 
     # ── Blog content preview ──────────────────────────────────────────────────
     if blog_text:
-        with st.expander("📝 Blog Content Preview", expanded=False):
+        with st.expander("📝 Blog Content Preview (parsed)", expanded=False):
             st.text(blog_text[:5000] + ("\n\n[… truncated]" if len(blog_text) > 5000 else ""))
 
     # ── Idle guard ────────────────────────────────────────────────────────────
     if not run_btn:
         st.info(
             "**Getting started:**\n\n"
-            "1. Upload your **Blog Content Document** (.docx or .pdf) in the sidebar.\n"
-            "2. Fill in **Focus Keyword**, **SEO Title**, and **Meta Description**.\n"
+            "1. **Upload** your blog (.docx / .pdf) or **Paste** its content in the tabs above.\n"
+            "2. Fill in **Focus Keyword**, **SEO Title**, and **Meta Description** in the sidebar.\n"
             "3. Optionally add **Secondary Keywords** (comma-separated).\n"
             "4. Click **▶ Run Analysis**."
         )
         return
 
-    if blog_text is None:
-        st.error("A Blog Content Document is required.")
-        return
-    if not blog_text.strip():
-        st.error("The blog document appears to be empty or could not be parsed.")
+    if not blog_text or not blog_text.strip():
+        st.error("Please upload a blog document or paste content in the Paste Content tab.")
         return
 
     # ── Use embedded guidelines ───────────────────────────────────────────────
     G = EMBEDDED_GUIDELINES
+
+    # ── Ensure headings are marked ────────────────────────────────────────────
+    # Pasted content from editors without <h1> tags has no '#' markers.
+    # Apply the same heuristic used for PDFs so structural checks work correctly.
+    _first_nonempty = next((l.strip() for l in blog_text.split("\n") if l.strip()), "")
+    if not _first_nonempty.startswith("#"):
+        blog_text = _mark_pdf_headings(blog_text)
 
     # ── Build metrics ─────────────────────────────────────────────────────────
     with st.spinner("Analysing content…"):
@@ -947,13 +1151,18 @@ def main() -> None:
     if sec_data:
         for row in sec_data:
             d = row["Density %"]
-            # Guideline: at least one secondary keyword between 0.3%–0.4%
             row["Status"] = (
                 "🟢 In Range (0.3–0.4%)" if 0.3 <= d <= 0.4 else
                 "🟡 Low (< 0.3%)"        if d < 0.3          else
                 "🟠 High (> 0.4%)"
             )
         st.dataframe(sec_data, use_container_width=True, hide_index=True)
+        best = max(sec_data, key=lambda r: r["Density %"])
+        st.caption(
+            f"The **Min Secondary Keyword Density** rule checks whether at least one "
+            f"secondary keyword has density ≥ 0.3 %. "
+            f"Highest here: **{best['Keyword / Phrase']}** at **{best['Density %']} %**."
+        )
     else:
         st.caption("Enter secondary keywords in the sidebar to track their density.")
 
@@ -970,31 +1179,28 @@ def main() -> None:
         if result is None:
             unknown_rows.append((label, None, _fmt_val(value), "Manual check required"))
         else:
-            passed, required, actual = result
-            known_rows.append((label, passed, required, actual))
+            status, required, actual = result
+            known_rows.append((label, status, required, actual))
 
-    all_rows  = known_rows + unknown_rows
+    all_rows   = known_rows + unknown_rows
     left_rows  = all_rows[0::2]
     right_rows = all_rows[1::2]
 
     cl1, cl2 = st.columns(2)
     with cl1:
-        for label, passed, required, actual in left_rows:
-            _check_row(label, passed, required, actual)
+        for label, status, required, actual in left_rows:
+            _check_row(label, status, required, actual)
     with cl2:
-        for label, passed, required, actual in right_rows:
-            _check_row(label, passed, required, actual)
+        for label, status, required, actual in right_rows:
+            _check_row(label, status, required, actual)
 
     # ── Per-paragraph breakdown ───────────────────────────────────────────────
     st.divider()
     with st.expander("📄 Per-Paragraph Word-Count Breakdown", expanded=False):
         rows = M["_struct"]["para_lengths"]
         max_limit = G.get("MAX_PARAGRAPH_WORDS", DEFAULTS["MAX_PARAGRAPH_WORDS"])
-        min_limit = G.get("MIN_PARAGRAPH_WORDS", 0)
         if not isinstance(max_limit, (int, float)):
             max_limit = DEFAULTS["MAX_PARAGRAPH_WORDS"]
-        if not isinstance(min_limit, (int, float)):
-            min_limit = 0
         if rows:
             st.dataframe(
                 [
@@ -1002,9 +1208,7 @@ def main() -> None:
                         "Preview": (p[:110] + "…") if len(p) > 110 else p,
                         "Words": pw,
                         "Status": (
-                            "🔴 Too long"  if pw > max_limit else
-                            "🟡 Too short" if pw < min_limit and min_limit > 0 else
-                            "🟢 OK"
+                            "🔴 Too long" if pw > max_limit else "🟢 OK"
                         ),
                     }
                     for p, pw in rows
@@ -1015,12 +1219,26 @@ def main() -> None:
         else:
             st.caption("No body paragraphs detected.")
 
+    # ── Transition words ──────────────────────────────────────────────────────
+    with st.expander("🔀 Transition Words Found", expanded=False):
+        tw_matches = transition_words_debug(blog_text)
+        if tw_matches:
+            st.caption(f"**{len(tw_matches)}** sentences contain a transition word (out of {len([s for s in re.split(r'[.!?]+', blog_text) if s.strip()])} total sentences).")
+            for sent, tw in tw_matches[:40]:
+                highlighted = re.sub(
+                    r"(" + re.escape(tw) + r")",
+                    r"**\1**", sent, flags=re.IGNORECASE
+                )
+                st.markdown(f"- {highlighted}")
+        else:
+            st.caption("No transition words detected.")
+
     # ── Link details ──────────────────────────────────────────────────────────
     with st.expander("🔗 Detected Links", expanded=False):
         ld = M["_links"]
         lc1, lc2 = st.columns(2)
         with lc1:
-            st.markdown(f"**Internal links ({ld['internal_link_count']})**")
+            st.markdown(f"**Internal links ({ld['internal_link_count']}) — domain: `{internal_domain}`**")
             if ld["internal_urls"]:
                 anchors = ld.get("internal_anchors", [])
                 for idx, u in enumerate(ld["internal_urls"]):
@@ -1029,9 +1247,12 @@ def main() -> None:
             else:
                 st.caption("None found.")
         with lc2:
-            st.markdown(f"**External links ({ld['external_link_count']})**")
-            for u in (ld["external_urls"] or ["None found."])[:30]:
-                st.markdown(f"- {u}")
+            st.markdown(f"**External links ({ld['external_link_count']}) — counted against ≤ {G.get('MAX_EXTERNAL_LINKS', 3)} limit**")
+            if ld["external_urls"]:
+                for u in ld["external_urls"][:30]:
+                    st.markdown(f"- {u}")
+            else:
+                st.caption("None found.")
 
 
 if __name__ == "__main__":
