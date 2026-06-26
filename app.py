@@ -84,7 +84,7 @@ RULE_LABELS: Dict[str, str] = {
     "META_KEYWORD":                 "Keyword in Meta Description",
     "META_LENGTH_MAX":              "Meta Description Max Length",
     "FIRST_PARAGRAPH_KEYWORD":      "Keyword in First Paragraph",
-    "FIRST_150_WORDS_KEYWORD_COUNT":"Keyword Count — First 150 Words",
+    "FIRST_150_WORDS_KEYWORD_COUNT":"Keyword Count — First 180 Words",
     "HEADING_KEYWORD":              "Keyword in Any Heading",
     "MIN_H2_H3_KEYWORD_COUNT":      "Keyword in H2 / H3 Headings",
     "KEYWORD_DISTRIBUTION_INTERVAL":"Keyword Distribution (max word gap)",
@@ -140,7 +140,7 @@ EMBEDDED_GUIDELINES: Dict[str, Union[bool, int, float]] = {
 
 GUIDELINE_DESCRIPTIONS: Dict[str, str] = {
     "TITLE_KEYWORD_H1":                "Primary keyword must be present in the H1 tag / Title of the page.",
-    "FIRST_150_WORDS_KEYWORD_COUNT":   "Use the primary keyword exactly 2 times within the first 150 words.",
+    "FIRST_150_WORDS_KEYWORD_COUNT":   "Use the primary keyword at least 2 times within the first 180 words.",
     "FIRST_PARAGRAPH_KEYWORD":         "The primary keyword must appear in the first paragraph of the blog.",
     "MIN_H2_H3_KEYWORD_COUNT":         "The primary keyword must be placed in H2 or H3 subheadings at least 2 times.",
     "META_TITLE_START_KEYWORD":        "The primary keyword must be placed right at the start of the meta title.",
@@ -169,7 +169,7 @@ _META_STANDALONE_RE = re.compile(
     re.IGNORECASE,
 )
 _META_COLON_RE = re.compile(
-    r"^(meta\s+description|seo\s+title|title\s+tag|focus\s+keyword"
+    r"^(meta\s+(?:description|title)|seo\s+title|title\s+tag|focus\s+keyword"
     r"|word\s+count|reading\s+time|published|author"
     r"|keywords?\s*(used)?|tags?|slug|excerpt|category|date)"
     r"[^.\n]*[:\-]",
@@ -246,8 +246,7 @@ def _is_list_or_table_block(text: str) -> bool:
 
 
 def _prose_text(text: str) -> str:
-    """Return prose-only text for Flesch and keyword-distribution gap.
-    Strips URLs, anchor markers, and list/table blocks."""
+    """Return prose-only text for Flesch readability (excludes headings, lists, tables)."""
     t = _ANCHOR_LINK_RE.sub(r"\1", text)
     t = _URL_RE.sub("", t)
     blocks = [b.strip() for b in re.split(r"\n\s*\n", t) if b.strip()]
@@ -258,6 +257,20 @@ def _prose_text(text: str) -> str:
         and len(b.split()) >= 20
     ]
     return " ".join(prose) if prose else t
+
+
+def _text_for_gap(text: str) -> str:
+    """Return URL/list-stripped text that KEEPS heading words for keyword gap calculation.
+    Heading keyword mentions should count against the gap so we don't inflate it."""
+    t = _ANCHOR_LINK_RE.sub(r"\1", text)
+    t = _URL_RE.sub("", t)
+    blocks = [b.strip() for b in re.split(r"\n\s*\n", t) if b.strip()]
+    kept = []
+    for b in blocks:
+        if _is_list_or_table_block(b):
+            continue
+        kept.append(re.sub(r"^#+\s*", "", b))  # strip # prefix, keep heading words
+    return " ".join(kept) if kept else t
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -574,9 +587,9 @@ def structural_analysis(clean_text: str, keyword: str) -> dict:
     min_pw = min((w for _, w in use_paras if w > 0), default=0)
 
     all_body_words  = " ".join(body).split()
-    first_150_text  = " ".join(all_body_words[:150])
-    first_150_kw    = (
-        len(re.findall(re.escape(keyword), first_150_text, re.IGNORECASE))
+    first_180_text  = " ".join(all_body_words[:180])
+    first_180_kw    = (
+        len(re.findall(re.escape(keyword), first_180_text, re.IGNORECASE))
         if keyword.strip() else 0
     )
 
@@ -591,7 +604,7 @@ def structural_analysis(clean_text: str, keyword: str) -> dict:
         "para_lengths":       para_lengths,
         "max_para_words":     max_pw,
         "min_para_words":     min_pw,
-        "first_150_kw_count": first_150_kw,
+        "first_150_kw_count": first_180_kw,
     }
 
 
@@ -644,36 +657,28 @@ def count_statistics(text: str) -> int:
 
 
 def analyze_faqs(blocks: List[str]) -> dict:
-    # Find FAQ section heading at block level first
-    faq_start = next(
-        (i for i, b in enumerate(blocks)
-         if re.search(r"\bfaq\b", b, re.IGNORECASE) and is_heading_block(b)),
-        -1,
-    )
-    # Also scan at line level (PDF may not have blank lines around the FAQ heading)
-    if faq_start < 0:
-        for i, b in enumerate(blocks):
-            for ln in b.split("\n"):
-                clean_ln = re.sub(r"^[#*_`]+\s*", "", ln).strip()
-                if re.match(r"^faqs?\s*$", clean_ln, re.IGNORECASE):
-                    faq_start = i
-                    break
-            if faq_start >= 0:
-                break
-
-    search_blocks = blocks[faq_start + 1:] if faq_start >= 0 else blocks
-
-    # Flatten all content lines from the FAQ section (handles PDF with no blank-line separators)
+    # Flatten ALL lines first (avoids block-boundary issues when FAQ heading
+    # and first question are in the same block with no blank line between them)
     all_lines: List[str] = []
-    for block in search_blocks:
+    for block in blocks:
         for ln in block.split("\n"):
             cleaned = re.sub(r"^[#*_`]+\s*", "", ln).strip()
             if cleaned:
                 all_lines.append(cleaned)
 
-    # Sentinel: stop collecting FAQ content if we hit metadata-like headings
+    # Find the "FAQs" / "FAQ" section heading at line level
+    faq_line_idx = -1
+    for idx, ln in enumerate(all_lines):
+        if re.match(r"^faqs?\s*$", ln, re.IGNORECASE):
+            faq_line_idx = idx
+            break
+
+    # Scan only from the line after the FAQ heading (or full doc if none found)
+    scan_lines = all_lines[faq_line_idx + 1:] if faq_line_idx >= 0 else all_lines
+
+    # Sentinel: stop collecting FAQ content if we hit metadata-like lines
     _META_STOP_RE = re.compile(
-        r"^(meta\s+description|seo\s+title|references?|bibliography|"
+        r"^(meta\s+(?:title|description)|seo\s+title|references?|bibliography|"
         r"tl;dr|about\s+the\s+author|conclusion|summary)",
         re.IGNORECASE,
     )
@@ -689,16 +694,16 @@ def analyze_faqs(blocks: List[str]) -> dict:
 
     answer_word_counts: List[int] = []
     i = 0
-    while i < len(all_lines):
-        if _is_section_stop(all_lines[i]):
+    while i < len(scan_lines):
+        if _is_section_stop(scan_lines[i]):
             break
-        if _is_faq_question(all_lines[i]):
+        if _is_faq_question(scan_lines[i]):
             j = i + 1
             answer_parts: List[str] = []
-            while j < len(all_lines) and not _is_faq_question(all_lines[j]):
-                if _is_section_stop(all_lines[j]):
+            while j < len(scan_lines) and not _is_faq_question(scan_lines[j]):
+                if _is_section_stop(scan_lines[j]):
                     break
-                answer_parts.append(all_lines[j])
+                answer_parts.append(scan_lines[j])
                 j += 1
             answer_text = " ".join(answer_parts).strip()
             if answer_text:
@@ -798,7 +803,8 @@ def build_metrics(
     faq             = analyze_faqs(split_blocks(clean_text))
     sec_results     = secondary_keyword_analysis(blog_text, secondary_kw_raw)
     sec_max_density = max((r["Density %"] for r in sec_results), default=0.0)
-    kw_gap          = keyword_dist_max_gap(prose if len(prose.split()) > 50 else blog_text, focus_keyword)
+    gap_text        = _text_for_gap(clean_text)
+    kw_gap          = keyword_dist_max_gap(gap_text if len(gap_text.split()) > 50 else blog_text, focus_keyword)
     cta_ok          = has_cta_at_end(blog_text)
     trans_pct       = transition_words_percent(blog_text)
 
@@ -1223,13 +1229,14 @@ def main() -> None:
     with st.expander("🔀 Transition Words Found", expanded=False):
         tw_matches = transition_words_debug(blog_text)
         if tw_matches:
-            st.caption(f"**{len(tw_matches)}** sentences contain a transition word (out of {len([s for s in re.split(r'[.!?]+', blog_text) if s.strip()])} total sentences).")
-            for sent, tw in tw_matches[:40]:
-                highlighted = re.sub(
-                    r"(" + re.escape(tw) + r")",
-                    r"**\1**", sent, flags=re.IGNORECASE
-                )
-                st.markdown(f"- {highlighted}")
+            total_sents = len([s for s in re.split(r'[.!?]+', blog_text) if s.strip()])
+            st.caption(f"**{len(tw_matches)}** sentences out of {total_sents} contain a transition word.")
+            word_counts = Counter(tw for _, tw in tw_matches)
+            words_display = "  ".join(
+                f"**{tw}**" + (f" ×{c}" if c > 1 else "")
+                for tw, c in sorted(word_counts.items(), key=lambda x: -x[1])
+            )
+            st.markdown(words_display)
         else:
             st.caption("No transition words detected.")
 
